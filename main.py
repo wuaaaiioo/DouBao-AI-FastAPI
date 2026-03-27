@@ -36,7 +36,7 @@ app.add_middleware(
     allow_origins=[FRONTEND_ORIGIN],
     allow_credentials=True,
     allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type"],
+    allow_headers=["Authorization", "Content-Type", "Accept", "Cache-Control"],
 )
 
 ZHIPU_API_KEY = "6444895464fc41739f775a5c385c0329.PU2D3vJmL7SeYcWu"
