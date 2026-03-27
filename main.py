@@ -1,198 +1,642 @@
-from fastapi import FastAPI, HTTPException, Body  # 新增 Body 导入
-from fastapi.middleware.cors import CORSMiddleware
-import requests
+import asyncio
+import base64
+import hashlib
+import hmac
 import json
-import asyncio  # 新增：异步支持
-import tiktoken  # 用来计算 Token 数（智谱兼容 OpenAI 的 Token 计算规则）
-from sse_starlette import EventSourceResponse  # 新增：支持SSE流式响应
+import os
+from contextlib import closing
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Literal
 
-# 初始化 FastAPI 应用
+import httpx
+import pymysql
+from pymysql.cursors import DictCursor
+import tiktoken
+from dotenv import load_dotenv
+from fastapi import Body, Depends, FastAPI, Header, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field, field_validator
+from sse_starlette import EventSourceResponse
+
+
 app = FastAPI()
 
-# 配置跨域（必须！否则前端报跨域错误）
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR.parent / ".env.shared")
+load_dotenv(BASE_DIR / ".env")
+
+FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "http://localhost:3000")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 开发阶段允许所有来源，生产环境替换为你的前端地址
+    allow_origins=[FRONTEND_ORIGIN],
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
-# -------------------------- 智谱 GLM-5 配置 --------------------------
-# 替换成你的智谱 API Key
 ZHIPU_API_KEY = "6444895464fc41739f775a5c385c0329.PU2D3vJmL7SeYcWu"
-# 智谱 GLM-5 API 地址（和 curl 里的一致）
 ZHIPU_API_URL = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
-# 智谱模型名（glm-4.7 保持不变）
 ZHIPU_MODEL = "glm-4.7"
-
-# -------------------------- Token 截断逻辑（保留原有） --------------------------
-# 初始化 Token 计算器（用 gpt-3.5-turbo 模型的规则，和智谱兼容）
+TOKEN_SECRET = os.getenv("TOKEN_SECRET", "replace-with-a-strong-secret")
+DB_HOST = os.getenv("DB_HOST", "127.0.0.1")
+DB_PORT = int(os.getenv("DB_PORT", "3306"))
+DB_USER = os.getenv("DB_USER", "root")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "xzl200318")
+DB_NAME = os.getenv("DB_NAME", "AI_Chat")
 enc = tiktoken.get_encoding("cl100k_base")
 
-def truncate_messages(messages: list, max_tokens: int = 60000):
-    """
-    截断历史消息，确保总 Token 不超过 max_tokens（预留 5536 Token 给输出）
-    :param messages: 历史消息列表 [{"role":"user/ai","content":"内容"}]
-    :param max_tokens: 输入最大 Token 数（建议设为 60000，留 5536 给输出）
-    :return: 截断后的消息列表
-    """
-    # 1. 计算每条消息的 Token 数
-    token_counts = []
-    for msg in messages:
-        # 每条消息的 Token = role 长度 + content 长度 + 固定开销（3 个 Token）
-        token_count = len(enc.encode(msg["role"])) + len(enc.encode(msg["content"])) + 3
-        token_counts.append(token_count)
-    
-    # 2. 从后往前累加，保留最近的消息，直到接近上限
-    total_tokens = 0
-    truncated_messages = []
-    # 倒序遍历（从最新的消息开始）
-    for i in reversed(range(len(messages))):
-        if total_tokens + token_counts[i] > max_tokens:
-            break  # 超过上限，停止添加
-        total_tokens += token_counts[i]
-        truncated_messages.append(messages[i])
-    
-    # 3. 反转回来（恢复正序）
-    truncated_messages.reverse()
-    
-    # 4. 如果全部截断后还是超，只保留最后 1 轮对话
-    if not truncated_messages and len(messages) > 0:
-        truncated_messages = [messages[-1]]
-    
-    return truncated_messages
 
-# -------------------------- 核心改造：流式调用智谱 API --------------------------
-async def stream_zhipu_api(messages: list):
-    """异步流式调用智谱API，修复编码问题，逐段返回内容"""
-    # 1. 先截断消息（防超限，保留原有逻辑）
-    truncated_msgs = truncate_messages(messages, max_tokens=60000)
-    
-    # 2. 构造官方格式的 payload（开启stream=true）
-    payload = {
-        "model": ZHIPU_MODEL,  # 保持你的模型名
-        "messages": truncated_msgs,
-        "max_tokens": 65536,
-        "temperature": 1.0,
-        "stream": True  # 开启流式输出（关键）
-    }
+class TokenPayload(BaseModel):
+    sub: str
+    username: str | None = None
+    name: str | None = None
+    type: str | None = None
+    iat: int | None = None
+    exp: int | None = None
 
-    headers = {
-        "Authorization": f"Bearer {ZHIPU_API_KEY}",
-        "Content-Type": "application/json"
-    }
 
-    try:
-        # 发送流式请求，开启stream=True
-        with requests.post(
-            ZHIPU_API_URL,
-            headers=headers,
-            data=json.dumps(payload, ensure_ascii=False),
-            stream=True,  # 开启流式响应
-            timeout=60
-        ) as response:
-            response.raise_for_status()
-            # 逐行解析流式数据
-            for line in response.iter_lines():
-                if not line:
-                    continue
-                # 核心修复：强制用UTF-8解码，解决latin-1编码错误
-                line_data = line.decode("utf-8").lstrip("data: ")
-                if line_data == "[DONE]":  # 流式结束标记
-                    break
-                try:
-                    data = json.loads(line_data)
-                    # 提取分段的回复内容
-                    content = data["choices"][0]["delta"].get("content", "")
-                    if content:
-                        # 确保内容是UTF-8编码的字符串，避免编码传递错误
-                        yield content.encode("utf-8").decode("utf-8")
-                        await asyncio.sleep(0.01)  # 可选：控制打字速度（数值越大越慢）
-                except json.JSONDecodeError:
-                    continue
-    except requests.exceptions.RequestException as e:
-        # 错误信息也强制UTF-8编码，避免中文报错乱码
-        error_msg = ""
-        if "429" in str(e):
-            error_msg = "调用频率过高，请稍后再试"
-        elif "context length exceeded" in str(e).lower():
-            error_msg = "上下文过长，自动保留最近消息继续对话"
-        else:
-            error_msg = f"调用智谱失败：{str(e)}"
-        yield error_msg.encode("utf-8").decode("utf-8")
+class MessagePayload(BaseModel):
+    role: Literal["system", "user", "assistant"]
+    content: str = Field(min_length=1, max_length=20000)
 
-# -------------------------- 保留原有非流式接口（备用） --------------------------
-def call_zhipu_api(messages: list):
-    """原有非流式调用（备用）"""
-    truncated_msgs = truncate_messages(messages, max_tokens=60000)
-    
-    payload = {
-        "model": ZHIPU_MODEL,
-        "messages": truncated_msgs,
-        "max_tokens": 65536,
-        "temperature": 1.0,
-        "stream": False  # 关闭流式
-    }
+    @field_validator("content")
+    @classmethod
+    def validate_content(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("消息内容不能为空")
+        return normalized
 
-    headers = {
-        "Authorization": f"Bearer {ZHIPU_API_KEY}",
-        "Content-Type": "application/json"
-    }
+
+class SessionCreatePayload(BaseModel):
+    title: str = Field(default="新会话", min_length=1, max_length=100)
+
+    @field_validator("title")
+    @classmethod
+    def validate_title(cls, value: str) -> str:
+        normalized = value.strip()
+        return normalized or "新会话"
+
+
+class ChatPayload(BaseModel):
+    messages: list[MessagePayload] = Field(min_length=1, max_length=200)
+    session_id: str | None = Field(default=None, max_length=64)
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")
+
+
+def base64url_decode(value: str) -> bytes:
+    normalized = value.replace("-", "+").replace("_", "/")
+    padding = "=" * (-len(normalized) % 4)
+    return base64.b64decode(normalized + padding)
+
+
+def verify_access_token(authorization: str | None) -> TokenPayload:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="缺少访问令牌")
+
+    token = authorization.removeprefix("Bearer ").strip()
+    parts = token.split(".")
+    if len(parts) != 3:
+        raise HTTPException(status_code=401, detail="访问令牌格式非法")
+
+    header_part, payload_part, signature_part = parts
+    signing_input = f"{header_part}.{payload_part}".encode("utf-8")
+    expected_signature = hmac.new(
+        TOKEN_SECRET.encode("utf-8"),
+        signing_input,
+        hashlib.sha256,
+    ).digest()
 
     try:
-        response = requests.post(
-            ZHIPU_API_URL,
-            headers=headers,
-            data=json.dumps(payload, ensure_ascii=False),
-            timeout=60
-        )
-        response.raise_for_status()
-        result = response.json()
-        ai_reply = result["choices"][0]["message"]["content"]
-        return ai_reply
+        signature = base64url_decode(signature_part)
+    except Exception as exc:
+        raise HTTPException(status_code=401, detail="访问令牌签名非法") from exc
 
-    except requests.exceptions.RequestException as e:
-        if "context length exceeded" in str(e).lower():
-            raise HTTPException(status_code=500, detail="上下文过长，自动保留最近消息继续对话")
-        raise HTTPException(status_code=500, detail=f"调用智谱失败：{str(e)}")
+    if len(signature) != len(expected_signature) or not hmac.compare_digest(signature, expected_signature):
+        raise HTTPException(status_code=401, detail="访问令牌签名非法")
 
-# -------------------------- 接口改造：新增流式接口 + 保留原有接口 --------------------------
-# 新增：流式接口（前端调用这个实现打字机效果）
-@app.post("/chat/stream")
-async def chat_stream(
-    messages: list = Body(...),
-    user_id: str = Body(default="default_user")
-):
-    # 返回SSE流式响应，指定UTF-8编码，彻底解决中文编码问题
-    return EventSourceResponse(
-        stream_zhipu_api(messages),
-        media_type="text/event-stream; charset=utf-8"
+    try:
+        payload_data = json.loads(base64url_decode(payload_part).decode("utf-8"))
+        payload = TokenPayload.model_validate(payload_data)
+    except Exception as exc:
+        raise HTTPException(status_code=401, detail="访问令牌内容非法") from exc
+
+    now = int(datetime.now(timezone.utc).timestamp())
+    if payload.exp is not None and payload.exp < now:
+        raise HTTPException(status_code=401, detail="访问令牌已过期")
+
+    if payload.type and payload.type != "access":
+        raise HTTPException(status_code=401, detail="访问令牌类型非法")
+
+    return payload
+
+
+def get_current_user(authorization: str | None = Header(default=None)) -> TokenPayload:
+    return verify_access_token(authorization)
+
+
+def get_conn():
+    return pymysql.connect(
+        host=DB_HOST,
+        port=DB_PORT,
+        user=DB_USER,
+        password=DB_PASSWORD,
+        database=DB_NAME,
+        charset="utf8mb4",
+        cursorclass=DictCursor,
+        autocommit=False,
+        connect_timeout=10,
+        read_timeout=10,
+        write_timeout=10,
     )
 
-# 保留：原有非流式接口（备用，不影响旧逻辑）
-@app.post("/chat")  
-async def chat(
-    messages: list = Body(...),
-    user_id: str = Body(default="default_user")
-):
-    """接收历史消息列表，实现多轮对话（非流式）"""
+
+def init_db() -> None:
+    with closing(get_conn()) as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("SET SESSION innodb_lock_wait_timeout = 10")
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS chat_sessions (
+                    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '会话ID',
+                    user_id BIGINT UNSIGNED NOT NULL COMMENT '所属用户ID',
+                    title VARCHAR(120) NOT NULL DEFAULT '新对话' COMMENT '会话标题',
+                    last_message_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '最后一条消息时间',
+                    is_deleted TINYINT NOT NULL DEFAULT 0 COMMENT '0未删除 1已删除',
+                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    PRIMARY KEY (id),
+                    KEY idx_sessions_user_lastmsg (user_id, last_message_at DESC),
+                    CONSTRAINT fk_sessions_user
+                      FOREIGN KEY (user_id) REFERENCES users (id)
+                      ON DELETE CASCADE ON UPDATE RESTRICT
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                """
+            )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS chat_messages (
+                    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '消息ID',
+                    session_id BIGINT UNSIGNED NOT NULL COMMENT '会话ID',
+                    role ENUM('system', 'user', 'assistant') NOT NULL COMMENT '消息角色',
+                    content MEDIUMTEXT NOT NULL COMMENT '消息内容',
+                    model_name VARCHAR(80) DEFAULT NULL COMMENT '模型名称',
+                    prompt_tokens INT UNSIGNED DEFAULT NULL,
+                    completion_tokens INT UNSIGNED DEFAULT NULL,
+                    total_tokens INT UNSIGNED DEFAULT NULL,
+                    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (id),
+                    KEY idx_messages_session_created (session_id, created_at),
+                    CONSTRAINT fk_messages_session
+                      FOREIGN KEY (session_id) REFERENCES chat_sessions(id)
+                      ON DELETE CASCADE ON UPDATE RESTRICT
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                """
+            )
+        conn.commit()
+
+
+@app.on_event("startup")
+async def on_startup() -> None:
+    init_db()
+
+
+def truncate_messages(messages: list[MessagePayload], max_tokens: int = 60000):
+    token_counts = []
+    for msg in messages:
+        token_count = len(enc.encode(msg.role)) + len(enc.encode(msg.content)) + 3
+        token_counts.append(token_count)
+
+    total_tokens = 0
+    truncated_messages: list[MessagePayload] = []
+    for i in reversed(range(len(messages))):
+        if total_tokens + token_counts[i] > max_tokens:
+            break
+        total_tokens += token_counts[i]
+        truncated_messages.append(messages[i])
+
+    truncated_messages.reverse()
+    if not truncated_messages and len(messages) > 0:
+        truncated_messages = [messages[-1]]
+
+    return truncated_messages
+
+
+def create_session_record(user_id: str, title: str = "新会话") -> dict:
+    safe_title = (title or "新会话").strip() or "新会话"
+
+    with closing(get_conn()) as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO chat_sessions (user_id, title, last_message_at)
+                VALUES (%s, %s, %s)
+                """,
+                (user_id, safe_title, utc_now()),
+            )
+            session_id = str(cursor.lastrowid)
+        conn.commit()
+
+    return {
+        "id": session_id,
+        "title": safe_title,
+        "preview": "",
+        "updatedAt": utc_now(),
+    }
+
+
+def get_session_or_404(conn, session_id: str, user_id: str):
+    with conn.cursor() as cursor:
+        cursor.execute(
+            "SELECT * FROM chat_sessions WHERE id = %s AND user_id = %s",
+            (session_id, user_id),
+        )
+        row = cursor.fetchone()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="会话不存在")
+
+    return row
+
+
+def list_sessions(user_id: str, page: int, page_size: int) -> dict:
+    offset = (page - 1) * page_size
+
+    with closing(get_conn()) as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "SELECT COUNT(*) AS total FROM chat_sessions WHERE user_id = %s AND is_deleted = 0",
+                (user_id,),
+            )
+            total = cursor.fetchone()["total"]
+            cursor.execute(
+                """
+                SELECT
+                    s.id,
+                    s.title,
+                    s.updated_at,
+                    s.last_message_at,
+                    COALESCE((
+                        SELECT SUBSTRING(m.content, 1, 200)
+                        FROM chat_messages m
+                        WHERE m.session_id = s.id
+                        ORDER BY m.created_at DESC, m.id DESC
+                        LIMIT 1
+                    ), '') AS preview
+                FROM chat_sessions s
+                WHERE s.user_id = %s AND s.is_deleted = 0
+                ORDER BY s.last_message_at DESC, s.id DESC
+                LIMIT %s OFFSET %s
+                """,
+                (user_id, page_size, offset),
+            )
+            rows = cursor.fetchall()
+
+    items = [
+        {
+            "id": str(row["id"]),
+            "title": row["title"],
+            "preview": row["preview"],
+            "updatedAt": row["last_message_at"] or row["updated_at"],
+        }
+        for row in rows
+    ]
+
+    return {
+        "items": items,
+        "total": total,
+        "hasMore": offset + len(items) < total,
+    }
+
+
+def encode_cursor(created_at: str, message_id: str) -> str:
+    return f"{created_at}|{message_id}"
+
+
+def decode_cursor(cursor: str | None) -> tuple[str, str] | None:
+    if not cursor or "|" not in cursor:
+        return None
+    created_at, message_id = cursor.split("|", 1)
+    return created_at, message_id
+
+
+def list_messages(user_id: str, session_id: str, cursor: str | None, limit: int) -> dict:
+    with closing(get_conn()) as conn:
+        get_session_or_404(conn, session_id, user_id)
+        params: list[str | int] = [session_id]
+        query = """
+            SELECT id, role, content, created_at
+            FROM chat_messages
+            WHERE session_id = %s
+        """
+
+        decoded_cursor = decode_cursor(cursor)
+        if decoded_cursor:
+            cursor_created_at, cursor_id = decoded_cursor
+            query += " AND (created_at < %s OR (created_at = %s AND id < %s))"
+            params.extend([cursor_created_at, cursor_created_at, cursor_id])
+
+        query += " ORDER BY created_at DESC, id DESC LIMIT %s"
+        params.append(limit + 1)
+        with conn.cursor() as cursor:
+            cursor.execute(query, params)
+            rows = cursor.fetchall()
+
+    has_more = len(rows) > limit
+    page_rows = rows[:limit]
+    ordered_rows = list(reversed(page_rows))
+    next_cursor = None
+
+    if has_more and page_rows:
+        last_row = page_rows[-1]
+        next_cursor = encode_cursor(last_row["created_at"], last_row["id"])
+
+    items = [
+        {
+            "id": str(row["id"]),
+            "role": "assistant" if row["role"] == "assistant" else "user",
+            "content": row["content"],
+            "createdAt": row["created_at"],
+        }
+        for row in ordered_rows
+    ]
+
+    return {
+        "items": items,
+        "nextCursor": next_cursor,
+        "hasMore": has_more,
+    }
+
+
+def maybe_update_session_title(conn, session_id: str, title_source: str) -> None:
+    with conn.cursor() as cursor:
+        cursor.execute(
+            "SELECT title FROM chat_sessions WHERE id = %s",
+            (session_id,),
+        )
+        session_row = cursor.fetchone()
+
+        if session_row and session_row["title"] in {"新会话", "新对话"}:
+            next_title = (title_source or "新会话").strip()[:20] or "新会话"
+            cursor.execute(
+                "UPDATE chat_sessions SET title = %s WHERE id = %s",
+                (next_title, session_id),
+            )
+
+
+def append_message(conn, session_id: str, role: str, content: str, created_at: str | None = None) -> str:
+    now = created_at or utc_now()
+    with conn.cursor() as cursor:
+        cursor.execute(
+            """
+            INSERT INTO chat_messages (session_id, role, content, created_at)
+            VALUES (%s, %s, %s, %s)
+            """,
+            (session_id, role, content, now),
+        )
+        return str(cursor.lastrowid)
+
+
+def store_chat_turn(user_id: str, session_id: str | None, messages: list[MessagePayload], assistant_content: str) -> dict:
+    latest_user_message = next(
+        (msg for msg in reversed(messages) if msg.role == "user" and msg.content.strip()),
+        None,
+    )
+
+    if not latest_user_message:
+        raise HTTPException(status_code=400, detail="缺少用户消息")
+
+    latest_user_content = latest_user_message.content.strip()
+    now = utc_now()
+
+    with closing(get_conn()) as conn:
+        if session_id:
+            get_session_or_404(conn, session_id, user_id)
+        else:
+            created = create_session_record(user_id, latest_user_content[:20] or "新会话")
+            session_id = created["id"]
+
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT role, content
+                FROM chat_messages
+                WHERE session_id = %s
+                ORDER BY created_at DESC, id DESC
+                LIMIT 1
+                """,
+                (session_id,),
+            )
+            last_message_row = cursor.fetchone()
+
+        if not last_message_row or not (
+            last_message_row["role"] == "user" and last_message_row["content"] == latest_user_content
+        ):
+            append_message(conn, session_id, "user", latest_user_content, now)
+
+        append_message(conn, session_id, "assistant", assistant_content or "未获取到有效回答", utc_now())
+        maybe_update_session_title(conn, session_id, latest_user_content)
+
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE chat_sessions
+                SET last_message_at = %s, updated_at = %s
+                WHERE id = %s AND user_id = %s
+                """,
+                (utc_now(), utc_now(), session_id, user_id),
+            )
+        conn.commit()
+
+    return {"session_id": session_id}
+
+
+async def stream_zhipu_api(messages: list[MessagePayload]):
+    truncated_msgs = truncate_messages(messages, max_tokens=60000)
+
+    payload = {
+        "model": ZHIPU_MODEL,
+        "messages": [{"role": msg.role, "content": msg.content} for msg in truncated_msgs],
+        "max_tokens": 65536,
+        "temperature": 1.0,
+        "stream": True,
+    }
+
+    headers = {
+        "Authorization": f"Bearer {ZHIPU_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
     try:
-        ai_reply = call_zhipu_api(messages)
-        return {
-            "success": True,
-            "data": {"reply": ai_reply},
-            "message": "成功"
-        }
-    except HTTPException as e:
-        return {
-            "success": False,
-            "data": None,
-            "message": e.detail
-        }
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            async with client.stream("POST", ZHIPU_API_URL, headers=headers, json=payload) as response:
+                response.raise_for_status()
+                async for line in response.aiter_lines():
+                    if not line:
+                        continue
+                    line_data = line.lstrip("data: ")
+                    if line_data == "[DONE]":
+                        break
+                    try:
+                        data = json.loads(line_data)
+                        content = data["choices"][0]["delta"].get("content", "")
+                        if content:
+                            yield content
+                            await asyncio.sleep(0.01)
+                    except (json.JSONDecodeError, KeyError, TypeError):
+                        continue
+    except httpx.TimeoutException:
+        yield "请求上游模型超时，请稍后再试"
+    except httpx.HTTPError as exc:
+        message = str(exc)
+        if "429" in message:
+            yield "调用频率过高，请稍后再试"
+        elif "context length exceeded" in message.lower():
+            yield "上下文过长，自动保留最近消息继续对话"
+        else:
+            yield f"调用智谱失败：{message}"
+
+
+async def call_zhipu_api(messages: list[MessagePayload]):
+    truncated_msgs = truncate_messages(messages, max_tokens=60000)
+
+    payload = {
+        "model": ZHIPU_MODEL,
+        "messages": [{"role": msg.role, "content": msg.content} for msg in truncated_msgs],
+        "max_tokens": 65536,
+        "temperature": 1.0,
+        "stream": False,
+    }
+
+    headers = {
+        "Authorization": f"Bearer {ZHIPU_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(ZHIPU_API_URL, headers=headers, json=payload)
+            response.raise_for_status()
+            result = response.json()
+            return result["choices"][0]["message"]["content"]
+    except httpx.TimeoutException as exc:
+        raise HTTPException(status_code=504, detail="调用智谱超时") from exc
+    except (httpx.HTTPError, KeyError, TypeError, json.JSONDecodeError) as exc:
+        message = str(exc)
+        if "context length exceeded" in message.lower():
+            raise HTTPException(status_code=500, detail="上下文过长，自动保留最近消息继续对话") from exc
+        raise HTTPException(status_code=500, detail=f"调用智谱失败：{message}") from exc
+
+
+@app.get("/chat/sessions")
+async def get_chat_sessions(
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=20, ge=1, le=50),
+    current_user: TokenPayload = Depends(get_current_user),
+):
+    return {
+        "code": 200,
+        "msg": "成功",
+        "data": list_sessions(current_user.sub, page, page_size),
+    }
+
+
+@app.post("/chat/sessions")
+async def create_chat_session(
+    payload: SessionCreatePayload,
+    current_user: TokenPayload = Depends(get_current_user),
+):
+    created = create_session_record(current_user.sub, payload.title)
+    return {
+        "code": 200,
+        "msg": "成功",
+        "data": created,
+    }
+
+
+@app.delete("/chat/sessions/{session_id}")
+async def delete_chat_session(
+    session_id: str,
+    current_user: TokenPayload = Depends(get_current_user),
+):
+    with closing(get_conn()) as conn:
+        get_session_or_404(conn, session_id, current_user.sub)
+        with conn.cursor() as cursor:
+            cursor.execute("DELETE FROM chat_sessions WHERE id = %s AND user_id = %s", (session_id, current_user.sub))
+        conn.commit()
+
+    return {
+        "code": 200,
+        "msg": "成功",
+        "data": True,
+    }
+
+
+@app.get("/chat/sessions/{session_id}/messages")
+async def get_chat_session_messages(
+    session_id: str,
+    cursor: str | None = Query(default=None),
+    limit: int = Query(default=20, ge=1, le=100),
+    current_user: TokenPayload = Depends(get_current_user),
+):
+    return {
+        "code": 200,
+        "msg": "成功",
+        "data": list_messages(current_user.sub, session_id, cursor, limit),
+    }
+
+
+@app.post("/chat/stream")
+async def chat_stream(
+    payload: ChatPayload = Body(...),
+    current_user: TokenPayload = Depends(get_current_user),
+):
+    async def event_generator():
+        full_content = ""
+        stored_session_id: str | None = None
+        try:
+            async for chunk in stream_zhipu_api(payload.messages):
+                full_content += chunk
+                yield {"data": chunk}
+        except Exception as exc:
+            yield {"data": f"流式响应异常：{str(exc)}"}
+        finally:
+            try:
+                stored = store_chat_turn(current_user.sub, payload.session_id, payload.messages, full_content)
+                stored_session_id = str(stored["session_id"])
+            except Exception as exc:
+                print(f"store chat turn failed: {exc}")
+        if stored_session_id:
+            yield {"data": json.dumps({"type": "session_created", "session_id": stored_session_id}, ensure_ascii=False)}
+        yield {"data": "[DONE]"}
+
+    return EventSourceResponse(
+        event_generator(),
+        media_type="text/event-stream; charset=utf-8",
+    )
+
+
+@app.post("/chat")
+async def chat(
+    payload: ChatPayload = Body(...),
+    current_user: TokenPayload = Depends(get_current_user),
+):
+    ai_reply = await call_zhipu_api(payload.messages)
+    stored = store_chat_turn(current_user.sub, payload.session_id, payload.messages, ai_reply)
+    return {
+        "success": True,
+        "data": {
+            "reply": ai_reply,
+            "session_id": stored["session_id"],
+        },
+        "message": "成功",
+    }
+
 
 @app.get("/")
 async def root():
-    return {"message": "智谱 GLM-4 流式+非流式多轮对话对接成功！"}
-
-# 启动命令不变：uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+    return {"message": "FastAPI 聊天与会话持久化接口已启动"}
