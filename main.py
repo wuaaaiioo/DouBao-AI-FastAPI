@@ -26,7 +26,11 @@ BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR.parent / ".env.shared")
 load_dotenv(BASE_DIR / ".env")
 
-FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "http://localhost:3000")
+def clean_env_string(value: str) -> str:
+    return value.strip().strip('"').strip("'")
+
+
+FRONTEND_ORIGIN = clean_env_string(os.getenv("FRONTEND_ORIGIN", "http://localhost:3000"))
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[FRONTEND_ORIGIN],
